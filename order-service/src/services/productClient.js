@@ -40,6 +40,19 @@ function translateError(err) {
         "product-service menolak token",
       );
     }
+    // Fase 5: sekarang ada Nginx di tengah. "Mati" dan "lambat" dilaporkan lewat 502/504
+    if (status === 502 || status === 503) {
+      return new ProductServiceError(
+        "UNAVAILABLE",
+        "product-service tidak dapat dihubungi",
+      );
+    }
+    if (status === 504) {
+      return new ProductServiceError(
+        "TIMEOUT",
+        "product-service tidak merespons tepat waktu",
+      );
+    }
     return new ProductServiceError(
       "BAD_RESPONSE",
       `product-service membalas status ${status}`,
