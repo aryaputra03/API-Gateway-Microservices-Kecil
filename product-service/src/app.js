@@ -3,13 +3,15 @@ const helmet = require("helmet");
 const cors = require("cors");
 const morgan = require("morgan");
 const productRoutes = require("./routes/product.routes");
-const internalRoutes = require("./routes/internal.routes");
+const { requestId } = require("./middlewares/requestId.middleware");
 
 const app = express();
 
+app.use(requestId);
 app.use(helmet());
 app.use(cors());
-app.use(morgan("dev"));
+morgan.token("id", (req) => req.requestId || "-");
+app.use(morgan(":date[iso] [:id] :method :url :status :response-time ms"));
 app.use(express.json({ limit: "10kb" }));
 
 app.get("/health", (req, res) => {

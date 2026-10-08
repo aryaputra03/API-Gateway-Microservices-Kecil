@@ -2,13 +2,9 @@ const axios = require("axios");
 
 const http = axios.create({
   baseURL: process.env.PRODUCT_SERVICE_URL || "http://localhost:4002",
-  timeout: Number(process.env.PRODUCT_SERVICE_TIMEOUT_MS) || 3000, // WAJIB: cegah request menggantung
+  timeout: Number(process.env.PRODUCT_SERVICE_TIMEOUT_MS) || 3000,
 });
 
-/**
- * Error khusus dengan "kind" yang menjawab pertanyaan:
- * "gagal total, lambat, atau ditolak secara bisnis?"
- */
 class ProductServiceError extends Error {
   constructor(kind, message, extra = {}) {
     super(message);
@@ -18,20 +14,55 @@ class ProductServiceError extends Error {
   }
 }
 
+// Error yang berarti "request pasti belum sampai ke server" -> selalu aman diulang
+const CONNECTION_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]);
+const TIMEOUT_ERROR_CODES = new Set(["ECONNABORTED", "ETIMEDOUT"]);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Menjalankan requestFn dengan retry, HANYA untuk error koneksi (selalu)
+ * dan timeout (hanya jika retryOnTimeout = true, dipakai untuk operasi baca).
+ * err.response berarti server MEMBALAS (walau isinya error bisnis) -> tidak pernah diulang di sini.
+ */
+async function callWithRetry(requestFn, { retries, retryOnTimeout, label }) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await requestFn();
+    } catch (err) {
+      const hasReply = Boolean(err.response);
+      const isConnError = !hasReply && CONNECTION_ERROR_CODES.has(err.code);
+      const isTimeout = !hasReply && TIMEOUT_ERROR_CODES.has(err.code);
+      const canRetry = isConnError || (retryOnTimeout && isTimeout);
+
+      if (!canRetry || attempt >= retries) throw err;
+
+      attempt += 1;
+      const delay = 150 * attempt; // backoff kecil: 150ms, lalu 300ms
+      console.warn(
+        `[retry] ${label} percobaan ${attempt}/${retries} setelah ${err.code} (delay ${delay}ms)`,
+      );
+      await sleep(delay);
+    }
+  }
+}
+
 function translateError(err) {
-  // 1) product-service MEMBALAS, tapi dengan status error
   if (err.response) {
     const { status, data } = err.response;
-    if (status === 404) {
+    if (status === 404)
       return new ProductServiceError("NOT_FOUND", "Produk tidak ditemukan");
-    }
     if (status === 409) {
       return new ProductServiceError(
         "INSUFFICIENT_STOCK",
         "Stok tidak mencukupi",
-        {
-          details: data && data.data,
-        },
+        { details: data && data.data },
       );
     }
     if (status === 401 || status === 403) {
@@ -40,7 +71,7 @@ function translateError(err) {
         "product-service menolak token",
       );
     }
-    // Fase 5: sekarang ada Nginx di tengah. "Mati" dan "lambat" dilaporkan lewat 502/504
+    // Fase 5: ada Nginx di tengah, "mati"/"lambat" dilaporkan lewat 502/504
     if (status === 502 || status === 503) {
       return new ProductServiceError(
         "UNAVAILABLE",
@@ -56,13 +87,10 @@ function translateError(err) {
     return new ProductServiceError(
       "BAD_RESPONSE",
       `product-service membalas status ${status}`,
-      {
-        upstreamStatus: status,
-      },
+      { upstreamStatus: status },
     );
   }
 
-  // 2) Request terkirim tapi TIDAK ada balasan dalam batas waktu -> LAMBAT
   if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
     return new ProductServiceError(
       "TIMEOUT",
@@ -70,39 +98,40 @@ function translateError(err) {
     );
   }
 
-  // 3) Tidak bisa tersambung sama sekali -> MATI (ECONNREFUSED, ECONNRESET, ENOTFOUND, ...)
   return new ProductServiceError(
     "UNAVAILABLE",
     "product-service tidak dapat dihubungi",
-    {
-      networkCode: err.code,
-    },
+    { networkCode: err.code },
   );
 }
 
-// authHeader = nilai header Authorization milik client, diteruskan apa adanya
-async function getStock(productId, authHeader) {
+async function getStock(productId, authHeader, requestId) {
   try {
-    const res = await http.get(
-      `/internal/products/${encodeURIComponent(productId)}/stock`,
-      {
-        headers: { Authorization: authHeader },
-      },
+    const res = await callWithRetry(
+      () =>
+        http.get(`/internal/products/${encodeURIComponent(productId)}/stock`, {
+          headers: { Authorization: authHeader, "X-Request-Id": requestId },
+        }),
+      { retries: 2, retryOnTimeout: true, label: "getStock" }, // operasi baca: boleh diulang lebih berani
     );
-    return res.data.data; // { productId, price, stock }
+    return res.data.data;
   } catch (err) {
     throw translateError(err);
   }
 }
 
-async function reduceStock(productId, quantity, authHeader) {
+async function reduceStock(productId, quantity, authHeader, requestId) {
   try {
-    const res = await http.post(
-      `/internal/products/${encodeURIComponent(productId)}/reduce-stock`,
-      { quantity },
-      { headers: { Authorization: authHeader } },
+    const res = await callWithRetry(
+      () =>
+        http.post(
+          `/internal/products/${encodeURIComponent(productId)}/reduce-stock`,
+          { quantity },
+          { headers: { Authorization: authHeader, "X-Request-Id": requestId } },
+        ),
+      { retries: 1, retryOnTimeout: false, label: "reduceStock" }, // operasi tulis: lebih hati-hati
     );
-    return res.data.data; // { productId, stock }
+    return res.data.data;
   } catch (err) {
     throw translateError(err);
   }

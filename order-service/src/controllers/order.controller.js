@@ -90,11 +90,12 @@ async function createOrder(req, res, next) {
     const { productId, quantity } = req.body;
     const { userId } = req.user;
     const authHeader = req.headers.authorization;
+    const requestId = req.requestId;
 
     // LANGKAH 1: tanya product-service, stok cukup? (belum ada yang disimpan)
     let product;
     try {
-      product = await productClient.getStock(productId, authHeader);
+      product = await productClient.getStock(productId, authHeader, requestId);
     } catch (err) {
       if (err instanceof ProductServiceError) return sendProductError(res, err);
       throw err;
@@ -126,7 +127,12 @@ async function createOrder(req, res, next) {
 
     // LANGKAH 3: kurangi stok di product-service
     try {
-      await productClient.reduceStock(productId, quantity, authHeader);
+      await productClient.reduceStock(
+        productId,
+        quantity,
+        authHeader,
+        requestId,
+      );
     } catch (err) {
       if (!(err instanceof ProductServiceError)) throw err;
 
