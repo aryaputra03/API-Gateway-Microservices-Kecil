@@ -1,0 +1,58 @@
+# Konfigurasi bersama untuk 2 instance product-service
+x-product-service: &product-service
+  build: ./product-service
+  image: microservices/product-service
+  env_file: ./product-service/.env
+  environment:
+    PORT: "4002"
+  restart: unless-stopped
+
+services:
+  auth-service:
+    build: ./auth-service
+    image: microservices/auth-service
+    env_file: ./auth-service/.env
+    environment:
+      PORT: "4001"
+    restart: unless-stopped
+
+  product-1:
+    <<: *product-service
+
+  product-2:
+    <<: *product-service
+
+  order-service:
+    build: ./order-service
+    image: microservices/order-service
+    env_file: ./order-service/.env
+    environment:
+      PORT: "4004"
+      # Di Docker, listener internal ada di container "gateway", bukan di 127.0.0.1
+      PRODUCT_SERVICE_URL: http://gateway:8081
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:stable-alpine
+    command:
+      [
+        "nginx",
+        "-c",
+        "/etc/nginx/custom/nginx.docker.conf",
+        "-g",
+        "daemon off;",
+      ]
+    ports:
+      - "80:80" # HANYA gateway yang dibuka ke luar. Jangan tambahkan 8081 di sini!
+    volumes:
+      - ./gateway:/etc/nginx/custom:ro
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      product-1:
+        condition: service_healthy
+      product-2:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    restart: unless-stopped
