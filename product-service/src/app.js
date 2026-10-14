@@ -3,6 +3,7 @@ const helmet = require("helmet");
 const cors = require("cors");
 const morgan = require("morgan");
 const productRoutes = require("./routes/product.routes");
+const internalRoutes = require("./routes/internal.routes");
 const { requestId } = require("./middlewares/requestId.middleware");
 
 const app = express();

@@ -1,10 +1,10 @@
-# Konfigurasi bersama untuk 2 instance product-service
 x-product-service: &product-service
   build: ./product-service
   image: microservices/product-service
   env_file: ./product-service/.env
   environment:
     PORT: "4002"
+    KAFKA_BROKERS: kafka:9092 # << BARU: override .env (yang isinya localhost:29092 utk mode manual)
   restart: unless-stopped
 
 services:
@@ -28,12 +28,12 @@ services:
     env_file: ./order-service/.env
     environment:
       PORT: "4004"
-      # Di Docker, listener internal ada di container "gateway", bukan di 127.0.0.1
       PRODUCT_SERVICE_URL: http://gateway:8081
+      KAFKA_BROKERS: kafka:9092 # << BARU
     restart: unless-stopped
 
   gateway:
-    image: nginx:stable-alpine
+    image: nginx:1.28.0-alpine
     command:
       [
         "nginx",
@@ -43,7 +43,7 @@ services:
         "daemon off;",
       ]
     ports:
-      - "80:80" # HANYA gateway yang dibuka ke luar. Jangan tambahkan 8081 di sini!
+      - "80:80"
     volumes:
       - ./gateway:/etc/nginx/custom:ro
     depends_on:
@@ -54,5 +54,58 @@ services:
       product-2:
         condition: service_healthy
       order-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===================== BARU: Kafka =====================
+  kafka:
+    image: apache/kafka:4.0.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "127.0.0.1:29092:29092" # hanya untuk mode manual di host, tidak dipublikasikan ke jaringan
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092",
+        ]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:4.0.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "for t in order.created stock.reserved stock.rejected product.events;
+       do /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create
+          --if-not-exists --topic $$t --partitions 3 --replication-factor 1;
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create
+          --if-not-exists --topic $$t.dlq --partitions 1 --replication-factor 1; done"
+    # Container ini SENGAJA berstatus "Exited (0)" setelah selesai -- bukan error.
+    # Tugasnya cuma bikin topic sekali lalu mati.
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "127.0.0.1:8088:8080" # alat dev, jangan dibuka ke jaringan publik
+    depends_on:
+      kafka:
         condition: service_healthy
     restart: unless-stopped
