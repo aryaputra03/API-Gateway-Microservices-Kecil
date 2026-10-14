@@ -5,8 +5,16 @@ const morgan = require("morgan");
 const productRoutes = require("./routes/product.routes");
 const internalRoutes = require("./routes/internal.routes");
 const { requestId } = require("./middlewares/requestId.middleware");
+const {
+  kafka,
+  kafkaStatus,
+  startKafkaConnectionWatcher,
+} = require("./config/kafka"); // << BARU
 
 const app = express();
+
+const kafkaProducer = kafka.producer(); // << BARU
+startKafkaConnectionWatcher(kafkaProducer); // << BARU -- jalan di background, tidak diawait
 
 app.use(requestId);
 app.use(helmet());
@@ -16,9 +24,12 @@ app.use(morgan(":date[iso] [:id] :method :url :status :response-time ms"));
 app.use(express.json({ limit: "10kb" }));
 
 app.get("/health", (req, res) => {
-  res
-    .status(200)
-    .json({ success: true, service: "product-service", status: "ok" });
+  res.status(200).json({
+    success: true,
+    service: "product-service",
+    status: "ok",
+    kafka: kafkaStatus.connected ? "connected" : "disconnected", // << BARU
+  });
 });
 
 app.use("/products", productRoutes);

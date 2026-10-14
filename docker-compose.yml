@@ -88,13 +88,12 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command: >
-      "for t in order.created stock.reserved stock.rejected product.events;
-       do /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create
-          --if-not-exists --topic $$t --partitions 3 --replication-factor 1;
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create
-          --if-not-exists --topic $$t.dlq --partitions 1 --replication-factor 1; done"
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        "for t in order.created stock.reserved stock.rejected product.events; do /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1; /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic $$t.dlq --partitions 1 --replication-factor 1; done",
+      ]
     # Container ini SENGAJA berstatus "Exited (0)" setelah selesai -- bukan error.
     # Tugasnya cuma bikin topic sekali lalu mati.
 
