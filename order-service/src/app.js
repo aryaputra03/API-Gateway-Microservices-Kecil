@@ -8,12 +8,36 @@ const {
   kafka,
   kafkaStatus,
   startKafkaConnectionWatcher,
-} = require("./config/kafka"); // << BARU
+} = require("./config/kafka");
+const { startOutboxRelay } = require("./kafka/outboxRelay"); // << BARU
+const { startConsumer } = require("./kafka/startConsumer"); // << BARU
+const stockResultConsumer = require("./kafka/consumers/stockResult.consumer"); // << BARU
+const supabase = require("./config/supabase"); // << BARU
 
 const app = express();
 
-const kafkaProducer = kafka.producer(); // << BARU
-startKafkaConnectionWatcher(kafkaProducer); // << BARU -- jalan di background, tidak diawait
+const kafkaProducer = kafka.producer();
+startKafkaConnectionWatcher(kafkaProducer);
+
+const OUTBOX_POLL_MS = Number(process.env.OUTBOX_POLL_MS) || 1000;
+startOutboxRelay(supabase, kafkaProducer, OUTBOX_POLL_MS); // << BARU -- order-service cuma 1 instance, tidak perlu flag enable/disable
+
+const stockResultKafkaConsumer = kafka.consumer({
+  groupId: "order-service-stock-result",
+});
+startConsumer(
+  stockResultKafkaConsumer,
+  ["stock.reserved", "stock.rejected"],
+  async ({ message }) => {
+    try {
+      const env = JSON.parse(message.value.toString());
+      await stockResultConsumer.handle(env);
+    } catch (err) {
+      console.error("[kafka] gagal proses stock result:", err.message);
+    }
+  },
+  "consumer stock result",
+);
 
 app.use(requestId);
 app.use(helmet());
@@ -27,7 +51,7 @@ app.get("/health", (req, res) => {
     success: true,
     service: "order-service",
     status: "ok",
-    kafka: kafkaStatus.connected ? "connected" : "disconnected", // << BARU
+    kafka: kafkaStatus.connected ? "connected" : "disconnected",
   });
 });
 
@@ -50,7 +74,6 @@ app.use((err, req, res, next) => {
       code: "INVALID_JSON",
     });
   }
-
   console.error(err);
   return res.status(500).json({
     success: false,

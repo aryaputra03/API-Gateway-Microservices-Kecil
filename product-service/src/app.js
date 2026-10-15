@@ -9,12 +9,45 @@ const {
   kafka,
   kafkaStatus,
   startKafkaConnectionWatcher,
-} = require("./config/kafka"); // << BARU
+} = require("./config/kafka");
+const { startOutboxRelay } = require("./kafka/outboxRelay"); // << BARU
+const { startConsumer } = require("./kafka/startConsumer"); // << BARU
+const orderCreatedConsumer = require("./kafka/consumers/orderCreated.consumer"); // << BARU
+const supabase = require("./config/supabase"); // << BARU
 
 const app = express();
 
-const kafkaProducer = kafka.producer(); // << BARU
-startKafkaConnectionWatcher(kafkaProducer); // << BARU -- jalan di background, tidak diawait
+const kafkaProducer = kafka.producer();
+startKafkaConnectionWatcher(kafkaProducer);
+
+// Relay outbox HANYA aktif di instance yang diberi OUTBOX_RELAY_ENABLED=true
+// (diset lewat docker-compose -- cuma product-1, supaya product-2 tidak ikut
+// menerbitkan event yang sama dua kali).
+if (process.env.OUTBOX_RELAY_ENABLED === "true") {
+  const pollMs = Number(process.env.OUTBOX_POLL_MS) || 1000;
+  startOutboxRelay(supabase, kafkaProducer, pollMs);
+}
+
+// Consumer order.created AKTIF DI KEDUA instance, groupId SAMA --
+// Kafka otomatis membagi 3 partisi topic order.created antara product-1 & product-2.
+const orderCreatedKafkaConsumer = kafka.consumer({
+  groupId: "product-service-order",
+});
+startConsumer(
+  orderCreatedKafkaConsumer,
+  ["order.created"],
+  async ({ message }) => {
+    try {
+      const env = JSON.parse(message.value.toString());
+      await orderCreatedConsumer.handle(env);
+    } catch (err) {
+      // Fase 9 belum ada DLQ -- error cukup di-log. Fase 10 membungkus ini
+      // dengan runWithDlq supaya pesan rusak tidak memblokir partisi selamanya.
+      console.error("[kafka] gagal proses order.created:", err.message);
+    }
+  },
+  "consumer order.created",
+);
 
 app.use(requestId);
 app.use(helmet());
@@ -28,7 +61,7 @@ app.get("/health", (req, res) => {
     success: true,
     service: "product-service",
     status: "ok",
-    kafka: kafkaStatus.connected ? "connected" : "disconnected", // << BARU
+    kafka: kafkaStatus.connected ? "connected" : "disconnected",
   });
 });
 
@@ -52,7 +85,6 @@ app.use((err, req, res, next) => {
       code: "INVALID_JSON",
     });
   }
-
   console.error(err);
   return res.status(500).json({
     success: false,

@@ -2,9 +2,6 @@ x-product-service: &product-service
   build: ./product-service
   image: microservices/product-service
   env_file: ./product-service/.env
-  environment:
-    PORT: "4002"
-    KAFKA_BROKERS: kafka:9092 # << BARU: override .env (yang isinya localhost:29092 utk mode manual)
   restart: unless-stopped
 
 services:
@@ -18,9 +15,19 @@ services:
 
   product-1:
     <<: *product-service
+    environment:
+      PORT: "4002"
+      KAFKA_BROKERS: kafka:9092
+      OUTBOX_RELAY_ENABLED: "true" # << HANYA product-1 yang menerbitkan outbox
+      OUTBOX_POLL_MS: "1000"
 
   product-2:
     <<: *product-service
+    environment:
+      PORT: "4002"
+      KAFKA_BROKERS: kafka:9092
+      OUTBOX_RELAY_ENABLED: "false" # << product-2 tetap konsumsi order.created, TIDAK menerbitkan outbox
+      OUTBOX_POLL_MS: "1000"
 
   order-service:
     build: ./order-service
@@ -29,7 +36,9 @@ services:
     environment:
       PORT: "4004"
       PRODUCT_SERVICE_URL: http://gateway:8081
-      KAFKA_BROKERS: kafka:9092 # << BARU
+      KAFKA_BROKERS: kafka:9092
+      ORDER_FLOW: sync # << ganti ke "event" manual kalau mau uji alur baru
+      OUTBOX_POLL_MS: "1000"
     restart: unless-stopped
 
   gateway:
