@@ -3,7 +3,6 @@ const helmet = require("helmet");
 const cors = require("cors");
 const morgan = require("morgan");
 const productRoutes = require("./routes/product.routes");
-const internalRoutes = require("./routes/internal.routes");
 const { requestId } = require("./middlewares/requestId.middleware");
 const {
   kafka,
@@ -12,8 +11,11 @@ const {
 } = require("./config/kafka");
 const { startOutboxRelay } = require("./kafka/outboxRelay"); // << BARU
 const { startConsumer } = require("./kafka/startConsumer"); // << BARU
+const { startRequestTraceConsumer } = require("./kafka/requestTraceConsumer");
 const orderCreatedConsumer = require("./kafka/consumers/orderCreated.consumer"); // << BARU
 const supabase = require("./config/supabase"); // << BARU
+
+const { startOutboxCleanup } = require("./jobs/outboxCleanup.job");
 
 const app = express();
 
@@ -26,6 +28,7 @@ startKafkaConnectionWatcher(kafkaProducer);
 if (process.env.OUTBOX_RELAY_ENABLED === "true") {
   const pollMs = Number(process.env.OUTBOX_POLL_MS) || 1000;
   startOutboxRelay(supabase, kafkaProducer, pollMs);
+  startOutboxCleanup(supabase);
 }
 
 // Consumer order.created AKTIF DI KEDUA instance, groupId SAMA --
@@ -41,8 +44,13 @@ startConsumer(
   "consumer order.created",
 );
 
+// Observability-only group: every product replica logs the same order request
+// ID without duplicating stock reservation work.
+const requestTraceKafkaConsumer = startRequestTraceConsumer(kafka, "product");
+
 app.locals.kafkaProducer = kafkaProducer;
 app.locals.kafkaConsumer = orderCreatedKafkaConsumer;
+app.locals.kafkaConsumers = [orderCreatedKafkaConsumer, requestTraceKafkaConsumer];
 
 app.use(requestId);
 app.use(helmet());
@@ -61,7 +69,6 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/products", productRoutes);
-app.use("/internal", internalRoutes);
 
 app.use((req, res) => {
   res.status(404).json({

@@ -10,8 +10,6 @@ function notFound(res) {
   });
 }
 
-/* ============ ENDPOINT PUBLIK (client-facing) ============ */
-
 async function listProducts(req, res, next) {
   try {
     const page = parseInt(req.query.page, 10) || 1;
@@ -55,7 +53,6 @@ async function getProduct(req, res, next) {
 
 async function createProduct(req, res, next) {
   try {
-    // Whitelist field: id & created_at tidak boleh diisi client
     const { name, description, price, stock } = req.body;
 
     const { data, error } = await supabase
@@ -133,75 +130,10 @@ async function deleteProduct(req, res, next) {
   }
 }
 
-/* ============ ENDPOINT INTERNAL (dipanggil order-service) ============ */
-
-async function getStock(req, res, next) {
-  try {
-    const { data, error } = await supabase
-      .from("products")
-      .select("id, price, stock")
-      .eq("id", req.params.id)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return notFound(res);
-
-    return res.status(200).json({
-      success: true,
-      data: { productId: data.id, price: data.price, stock: data.stock },
-    });
-  } catch (err) {
-    return next(err);
-  }
-}
-
-async function reduceStock(req, res, next) {
-  try {
-    const { id } = req.params;
-    const { quantity } = req.body;
-
-    const { data, error } = await supabase.rpc("reduce_stock", {
-      p_id: id,
-      p_qty: quantity,
-    });
-
-    if (error) throw error;
-
-    // 0 baris = produk tidak ada ATAU stok tidak cukup. Cari tahu yang mana.
-    if (!data || data.length === 0) {
-      const { data: product, error: findError } = await supabase
-        .from("products")
-        .select("id, stock")
-        .eq("id", id)
-        .maybeSingle();
-
-      if (findError) throw findError;
-      if (!product) return notFound(res);
-
-      return res.status(409).json({
-        success: false,
-        message: "Stok tidak mencukupi",
-        code: "INSUFFICIENT_STOCK",
-        data: { available: product.stock, requested: quantity },
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Stok berhasil dikurangi",
-      data: { productId: data[0].product_id, stock: data[0].new_stock },
-    });
-  } catch (err) {
-    return next(err);
-  }
-}
-
 module.exports = {
   listProducts,
   getProduct,
   createProduct,
   updateProduct,
   deleteProduct,
-  getStock,
-  reduceStock,
 };

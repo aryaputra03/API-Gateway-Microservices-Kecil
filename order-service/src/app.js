@@ -28,6 +28,8 @@ const stockResultKafkaConsumer = kafka.consumer({
   groupId: "order-service-stock-result",
 });
 
+const { startOutboxCleanup } = require("./jobs/outboxCleanup.job"); // << BARU, taruh dekat require lain
+
 startConsumer(
   stockResultKafkaConsumer,
   kafkaProducer, // << BARU
@@ -37,6 +39,7 @@ startConsumer(
 );
 
 startPendingTimeoutJob();
+startOutboxCleanup(supabase);
 
 app.locals.kafkaProducer = kafkaProducer;
 app.locals.kafkaConsumer = stockResultKafkaConsumer;

@@ -35,9 +35,7 @@ services:
     env_file: ./order-service/.env
     environment:
       PORT: "4004"
-      PRODUCT_SERVICE_URL: http://gateway:8081
       KAFKA_BROKERS: kafka:9092
-      ORDER_FLOW: sync # << ganti ke "event" manual kalau mau uji alur baru
       OUTBOX_POLL_MS: "1000"
       PENDING_TIMEOUT_MS: "120000"
     restart: unless-stopped

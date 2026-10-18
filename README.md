@@ -1,179 +1,177 @@
-# API Gateway + Microservices Kecil
+# API Gateway + Microservices Kecil (v2 — Event-Driven)
 
-Sistem belajar arsitektur microservices: 3 service mandiri (auth, product, order), masing-masing dengan database/schema sendiri di Supabase, disatukan di belakang API Gateway (Nginx) dengan load balancing dan rate limiting.
+Project belajar backend engineering: dimulai dari API Gateway + 3 microservice sinkron (v1.0),
+lalu diupgrade jadi arsitektur event-driven dengan Apache Kafka (outbox pattern, idempotency,
+DLQ) dan pencarian full-text dengan Elasticsearch (v2.0).
+
+## Daftar Isi
+
+- [Arsitektur](#arsitektur)
+- [Struktur Repo](#struktur-repo)
+- [Menjalankan dari Nol](#menjalankan-dari-nol)
+- [Endpoint](#endpoint)
+- [Katalog Event Kafka](#katalog-event-kafka)
+- [Environment Variables](#environment-variables)
+- [Desain Reliabilitas](#desain-reliabilitas)
+- [Hasil Uji Skenario Kegagalan](#hasil-uji-skenario-kegagalan)
+
+---
 
 ## Arsitektur
 
 ```
-                              ┌──────────────────┐
-                 ┌───────────▶│  auth-service     │  (4001)
-                 │            │  schema: auth_service
-   Client        │            └──────────────────┘
-     │           │
-     ▼           │            ┌──────────────────┐
-┌─────────┐      ├───────────▶│ product-service   │  x2 instance (4002, 4003)
-│  Nginx  │──────┤            │  schema: product   │  round-robin + failover
-│ gateway │      │            └─────────┬────────┘
-│ (:80)   │      │                      ▲
-└─────────┘      │                      │ HTTP (verifikasi JWT sendiri,
-                 │            ┌─────────┴────────┐  tanpa panggil auth-service)
-                 └───────────▶│  order-service     │  (4004)
-                              │  schema: "order"    │
-                              └──────────────────┘
+                            ┌─────────────────┐
+                 ┌─────────▶│  auth-service    │
+                 │          │  :4001           │
+                 │          └─────────────────┘
+                 │
+Client ──▶ Nginx │          ┌─────────────────┐
+ Gateway   :80   ├─────────▶│ product-service  │◀──┐
+                 │          │  :4002 (x2)      │   │
+                 │          └────────┬────────┘   │
+                 │                   │             │ Kafka
+                 │          ┌────────▼────────┐   │ (outbox
+                 ├─────────▶│  order-service   │───┘  pattern)
+                 │          │  :4004           │
+                 │          └────────┬────────┘
+                 │                   │
+                 │          ┌────────▼────────┐    ┌───────────────┐
+                 └─────────▶│  search-service  │◀───│ Elasticsearch │
+                            │  :4005           │    │  (internal)   │
+                            └─────────────────┘    └───────────────┘
+
+Semua service privat — hanya terjangkau lewat jaringan internal Docker Compose.
+Satu-satunya pintu masuk dari luar adalah Nginx Gateway di port 80.
 ```
 
-Setiap service punya schema database sendiri dan **tidak pernah mengakses tabel service lain secara langsung**. Komunikasi antar service murni lewat HTTP, dengan JWT (dibuat auth-service, diverifikasi mandiri oleh product-service dan order-service) sebagai satu-satunya "bahasa" bersama.
+**Alur order (event-driven, sejak Fase 9):**
 
-Request ID (`X-Request-Id`) mengalir dari client → gateway → order-service → product-service dan tercatat di log ketiga service, sehingga satu alur request bisa ditelusuri lintas service lewat satu ID yang sama.
+1. Client `POST /api/orders` → order-service langsung menyimpan order (status `pending`) +
+   menulis event ke tabel `outbox_events` miliknya sendiri, dalam **satu transaksi** di Postgres.
+   Balasan **202** langsung diberikan — tidak ada panggilan HTTP ke product-service sama sekali.
+2. Relay outbox order-service membaca baris outbox yang belum terkirim, menerbitkannya ke topic
+   Kafka `order.created`, lalu menandainya terkirim.
+3. product-service (berjalan di 2 instance, `product-1` dan `product-2`, dalam satu consumer
+   group) mengonsumsi `order.created`, mengurangi stok secara atomik, lalu menulis hasilnya
+   (`stock.reserved` atau `stock.rejected`) ke outbox miliknya sendiri.
+4. order-service mengonsumsi hasil itu, memperbarui status order jadi `confirmed` atau `rejected`.
+5. Setiap perubahan pada tabel produk (termasuk pengurangan stok di langkah 3) memicu trigger
+   Postgres yang menulis event ke topic `product.events`, dikonsumsi oleh search-service untuk
+   menjaga index Elasticsearch tetap sinkron.
 
-## Menjalankan Sistem
-
-### Opsi A — Manual (untuk development)
-
-Prasyarat: Node.js 22+, akun Supabase dengan tiga schema (`auth_service`, `product`, `"order"`) sudah dibuat.
-
-Untuk tiap folder `auth-service/`, `product-service/`, `order-service/`:
-
-```bash
-cp .env.example .env     # isi SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-                          # JWT_SECRET WAJIB SAMA PERSIS di ketiga .env
-npm install
-npm run dev
-```
-
-Jalankan instance kedua product-service (opsional, untuk menguji load balancing):
-
-```powershell
-cd product-service
-$env:PORT = "4003"; npm run dev     # PowerShell
-```
-
-```bash
-cd product-service
-PORT=4003 npm run dev               # bash / Git Bash
-```
-
-Jalankan gateway (Windows, Nginx diekstrak ke `C:\nginx`):
-
-```powershell
-cd C:\nginx
-.\nginx.exe -p C:\nginx -c "<path-repo>\gateway\nginx.conf"
-```
-
-Sistem siap diakses di `http://localhost`.
-
-### Opsi B — Docker Compose (satu perintah)
-
-```bash
-docker compose up --build -d
-docker compose ps        # pastikan semua service berstatus "healthy"
-```
-
-Menyalakan 5 container: `auth-service`, 2 instance `product-service` (`product-1`, `product-2`), `order-service`, dan `gateway`. Hanya port 80 yang terbuka ke host; service lain terisolasi di jaringan internal Docker.
-
-```bash
-docker compose logs -f gateway     # lihat log gabungan termasuk upstream mana yang melayani
-docker compose down                # hentikan dan hapus container
-```
-
-## Environment Variables
-
-| Variabel                      | Dipakai di     | Keterangan                                                                                                             |
-| ----------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                        | ketiga service | Port HTTP service. Di Docker Compose ditimpa lewat `environment:`                                                      |
-| `SUPABASE_URL`                | ketiga service | URL project Supabase                                                                                                   |
-| `SUPABASE_SERVICE_ROLE_KEY`   | ketiga service | Key dengan akses penuh, bypass RLS. **Jangan pernah dipakai di frontend**                                              |
-| `DB_SCHEMA`                   | ketiga service | Schema khusus tiap service: `auth_service`, `product`, `order`                                                         |
-| `JWT_SECRET`                  | ketiga service | **Harus identik** di ketiga `.env` — ini "perekat" yang membuat token lintas service bisa diverifikasi                 |
-| `JWT_EXPIRES_IN`              | auth-service   | Masa berlaku token, default `1h`                                                                                       |
-| `BCRYPT_ROUNDS`               | auth-service   | Cost factor hashing password, default `10`                                                                             |
-| `PRODUCT_SERVICE_URL`         | order-service  | Alamat product-service (langsung atau lewat listener internal Nginx)                                                   |
-| `PRODUCT_SERVICE_TIMEOUT_MS`  | order-service  | Batas waktu tunggu panggilan ke product-service, default `3000`                                                        |
-| `TEST_DELAY_BEFORE_REDUCE_MS` | order-service  | **Khusus pengujian** — jeda sebelum kurangi stok, untuk memicu skenario kegagalan. Biarkan `0` untuk penggunaan normal |
-
-## Daftar Endpoint (lewat gateway, `http://localhost/api`)
-
-### auth-service — `/api/auth`
-
-| Method | Path        | Auth   | Keterangan                                  |
-| ------ | ----------- | ------ | ------------------------------------------- |
-| POST   | `/register` | -      | Daftar user baru, `role` default `customer` |
-| POST   | `/login`    | -      | Mengembalikan JWT (`exp` 1 jam)             |
-| GET    | `/me`       | Bearer | Data user pemilik token                     |
-
-### product-service — `/api/products`
-
-| Method | Path   | Auth   | Keterangan                                                      |
-| ------ | ------ | ------ | --------------------------------------------------------------- |
-| GET    | `/`    | -      | List produk, dukung `?page&limit`                               |
-| GET    | `/:id` | -      | Detail satu produk                                              |
-| POST   | `/`    | Bearer | Buat produk                                                     |
-| PUT    | `/:id` | Bearer | Update sebagian field (`name`, `description`, `price`, `stock`) |
-| DELETE | `/:id` | Bearer | Hapus produk                                                    |
-
-Endpoint `/internal/products/:id/stock` dan `/internal/products/:id/reduce-stock` **hanya** dipakai order-service secara internal, sengaja tidak diekspos lewat gateway.
-
-### order-service — `/api/orders`
-
-| Method | Path   | Auth   | Keterangan                                                                                  |
-| ------ | ------ | ------ | ------------------------------------------------------------------------------------------- |
-| POST   | `/`    | Bearer | Buat order (`productId`, `quantity`). Memanggil product-service untuk cek lalu kurangi stok |
-| GET    | `/`    | Bearer | Riwayat order milik user yang login                                                         |
-| GET    | `/:id` | Bearer | Detail satu order, hanya milik sendiri                                                      |
-
-Format response selalu `{ success, message?, data?, code? }`. Error tidak pernah membocorkan stack trace ke client; detail lengkap hanya tercatat di log server.
-
-## Skenario Kegagalan yang Sudah Diuji
-
-| #   | Skenario                                                       | Cara memicu                                                                | Hasil yang diharapkan                                                                                                                   |
-| --- | -------------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | product-service mati total sebelum order dibuat                | Matikan semua instance, lalu `POST /orders`                                | `503 PRODUCT_SERVICE_UNAVAILABLE`, order **tidak** tersimpan, respons < 1 detik, tidak hang                                             |
-| 2   | product-service mati setelah stok dicek tapi sebelum dikurangi | Set `TEST_DELAY_BEFORE_REDUCE_MS`, matikan service di tengah jeda          | Order tersimpan dengan `status: failed`, kolom `failure_reason` terisi                                                                  |
-| 3   | product-service lambat (timeout)                               | `PRODUCT_SERVICE_TIMEOUT_MS=1`, atau arahkan ke alamat yang tidak membalas | `504 PRODUCT_SERVICE_TIMEOUT`, tidak menggantung selamanya                                                                              |
-| 4   | Satu instance product-service mati (dari 2)                    | `docker compose stop product-2`, atau matikan salah satu terminal          | Semua request client tetap `200`; Nginx otomatis pindah ke instance sehat (`proxy_next_upstream`)                                       |
-| 5   | Load balancing                                                 | 10 request berturut ke `GET /api/products`, bandingkan log kedua instance  | Terbagi kira-kira 5/5 (round-robin)                                                                                                     |
-| 6   | Rate limit terlampaui                                          | Kirim lebih dari ~30 request/detik dari satu client                        | Sebagian ditolak `429 RATE_LIMITED`, service tidak crash, request yang lolos tetap normal                                               |
-| 7   | Dua request bersamaan merebut stok terakhir                    | 10 request paralel mengurangi stok dari stok awal 5                        | Tepat 5x `200` dan 5x `409`, stok akhir tidak pernah negatif (atomik di level database)                                                 |
-| 8   | Header `Authorization` dihapus dari Nginx (sengaja)            | Comment baris `proxy_set_header Authorization` lalu reload                 | Request yang butuh token mulai gagal `401` walau client sudah mengirim token — membuktikan Nginx menentukan header mana yang diteruskan |
-| 9   | ID bukan UUID yang valid                                       | `GET /api/products/abc`                                                    | `400 VALIDATION_ERROR`, bukan `500`                                                                                                     |
-| 10  | Mengakses order milik orang lain                               | Ganti `:id` di `GET /api/orders/:id` dengan order milik user lain          | `404 ORDER_NOT_FOUND` (bukan `403`, untuk mencegah _user enumeration_ / IDOR)                                                           |
-
-## Penelusuran Request Lintas Service
-
-Setiap request mendapat `X-Request-Id` (dikirim client, atau dibuat otomatis oleh Nginx bila belum ada) dan tercatat di log ketiga service dengan format:
-
-```
-2026-10-07T07:15:32.120Z [a1b2c3d4-...] POST /orders 201 842 ms
-```
-
-Untuk menelusuri satu order yang gagal: ambil nilai header `X-Request-Id` dari response, lalu cari ID itu di log gateway, order-service, dan product-service. Urutan baris yang ditemukan menunjukkan persis di langkah mana kegagalan terjadi.
-
-## Keputusan Desain & Batasan yang Disadari
-
-- **Satu order = satu produk.** Order multi-item membutuhkan _compensating transaction_ (saga) untuk membatalkan item yang sudah terpotong stoknya jika item lain gagal — di luar scope project ini.
-- **Nama schema disesuaikan** menjadi `auth_service`, `product`, dan `"order"` (dengan tanda kutip) karena `auth` sudah dipakai Supabase Auth bawaan, dan `order` adalah reserved word SQL.
-- **Retry hanya untuk error koneksi yang jelas belum sampai ke server**, dan retry untuk timeout hanya diaktifkan pada operasi baca (`getStock`), tidak pada operasi tulis (`reduceStock`) — karena timeout pada operasi tulis berarti hasilnya ambigu (bisa jadi stok sudah terpotong, hanya balasannya yang tidak sampai).
-- **Tidak ada idempotency key.** Pada kombinasi retry/failover yang sangat spesifik, ada risiko teoretis stok terpotong dua kali untuk satu order jika request pertama sebenarnya sukses tapi balasannya hilang. Mitigasi penuh membutuhkan idempotency key per request, di luar scope project ini.
-- **JWT stateless, tanpa mekanisme pencabutan token.** Token yang sudah terbit tetap valid sampai `exp`, walau akun pemiliknya diblokir sekalipun.
+Pola **outbox + consumer idempotent** ini sengaja dipakai supaya sistem tahan terhadap Kafka mati,
+service mati di tengah proses, pesan duplikat, dan pesan rusak — lihat [Desain
+Reliabilitas](#desain-reliabilitas).
 
 ## Struktur Repo
 
 ```
-.
-├── auth-service/
-├── product-service/
-├── order-service/
-├── gateway/
-│   ├── nginx.conf           # mode manual (native)
-│   └── nginx.docker.conf    # mode Docker Compose
+microservices-project/
+├── auth-service/        # registrasi, login, penerbit JWT
+├── product-service/     # CRUD produk, konsumsi order.created, index Elasticsearch (via event)
+├── order-service/       # buat & lihat order, konsumsi stock.reserved/rejected
+├── search-service/      # GET /search/products, konsumsi product.events
+├── gateway/              # konfigurasi Nginx (nginx.conf manual, nginx.docker.conf untuk Compose)
+├── sql/                  # migrasi SQL berurutan, 001 s.d. 006
 └── docker-compose.yml
 ```
 
-## Pengujian Cepat (Postman / PowerShell)
+## Menjalankan dari Nol
 
-1. `POST /api/auth/register` lalu `POST /api/auth/login` → simpan `token` dari response.
-2. `POST /api/products` dengan header `Authorization: Bearer <token>` → simpan `id` produk.
-3. `POST /api/orders` dengan body `{ "productId": "<id>", "quantity": 1 }`.
-4. `GET /api/orders` untuk melihat riwayat order milik sendiri.
+1. Salin tiap `*/.env.example` jadi `*/.env`, isi `SUPABASE_URL` dan
+   `SUPABASE_SERVICE_ROLE_KEY` (dari project Supabase kamu sendiri), dan `JWT_SECRET`
+   (string acak minimal 32 karakter, **harus identik** di `auth-service`, `product-service`,
+   `order-service`).
+2. `docker compose up -d` — tunggu semua container `healthy` (`docker compose ps`).
+3. Jalankan `sql/001_baseline.sql` sampai `sql/006_drop_sync_path.sql` **berurutan** di Supabase
+   SQL Editor.
+4. `docker compose exec product-1 node scripts/republish-products.js` — isi index Elasticsearch
+   dari produk yang sudah ada (kalau ada).
+5. `POST /api/auth/register` untuk buat akun, lalu jalankan manual di Supabase:
+   `UPDATE auth_service.users SET role='admin' WHERE email='...'` untuk akun yang mau dipakai
+   sebagai admin (role tidak bisa diset lewat API, sengaja).
+6. Coba lewat Postman atau PowerShell sesuai tabel endpoint di bawah.
 
-Detail skrip pengujian untuk tiap skenario kegagalan di atas (termasuk versi PowerShell-nya) ada di catatan pengembangan masing-masing fase pada riwayat project.
+## Endpoint
+
+Semua lewat gateway: `http://localhost/api/...`
+
+| Method | Path                   | Auth  | Keterangan                                                               |
+| ------ | ---------------------- | ----- | ------------------------------------------------------------------------ |
+| POST   | `/api/auth/register`   | -     | Daftar akun baru (role selalu `customer`)                                |
+| POST   | `/api/auth/login`      | -     | Dapat JWT (berlaku 1 jam)                                                |
+| GET    | `/api/products`        | -     | List produk, paginated                                                   |
+| GET    | `/api/products/:id`    | -     | Detail satu produk                                                       |
+| POST   | `/api/products`        | admin | Buat produk                                                              |
+| PUT    | `/api/products/:id`    | admin | Ubah produk                                                              |
+| DELETE | `/api/products/:id`    | admin | Hapus produk                                                             |
+| POST   | `/api/orders`          | user  | **202** — `{orderId, status:"pending"}`, diproses async                  |
+| GET    | `/api/orders`          | user  | List order milik user yang login                                         |
+| GET    | `/api/orders/:id`      | user  | Detail order (404 kalau bukan milik sendiri — anti-IDOR)                 |
+| GET    | `/api/search/products` | -     | Full-text search: `q`, `minPrice`, `maxPrice`, `page`, `limit` (maks 50) |
+
+## Katalog Event Kafka
+
+| Topic                                  | Diterbitkan oleh                                                           | Dikonsumsi oleh                                             | Payload inti                                                                                            |
+| -------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `order.created`                        | order-service (via outbox relay)                                           | product-service (`product-1`/`product-2`, 1 consumer group) | `orderId`, `productId`, `quantity`                                                                      |
+| `stock.reserved`                       | product-service (via outbox relay, hanya `product-1`)                      | order-service                                               | `orderId`, `unitPrice`, `newStock`                                                                      |
+| `stock.rejected`                       | product-service (via outbox relay, hanya `product-1`)                      | order-service                                               | `orderId`, `reason`                                                                                     |
+| `product.events`                       | product-service (trigger Postgres pada setiap INSERT/UPDATE/DELETE produk) | search-service                                              | `type` (`product.created`/`updated`/`deleted`), `updatedAt`, `product{id,name,description,price,stock}` |
+| `<topic>.dlq` (satu per topic di atas) | consumer yang gagal memproses setelah 3x percobaan                         | — (inspeksi manual via kafka-ui)                            | Pesan asli + header `error`, `attempts`, `origin`                                                       |
+
+Setiap pesan dibungkus _envelope_ yang sama: `{eventId, type, version, occurredAt, requestId, payload}`.
+`requestId` diteruskan dari `X-Request-Id` gateway sampai ke consumer paling ujung, sehingga satu
+request bisa ditelusuri lintas semua service lewat `grep`/`Select-String` pada log (formatnya
+seragam: `<timestamp ISO> [<requestId>] <event> <id> -> <hasil>`).
+
+## Environment Variables
+
+| Service         | Variabel                                                                                                          | Keterangan                                                       |
+| --------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| auth-service    | `PORT`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DB_SCHEMA`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `BCRYPT_ROUNDS` | —                                                                |
+| product-service | di atas + `KAFKA_BROKERS`, `OUTBOX_RELAY_ENABLED`, `OUTBOX_POLL_MS`, `OUTBOX_RETENTION_DAYS`                      | Relay & cleanup outbox aktif hanya di `product-1`                |
+| order-service   | di atas (tanpa `OUTBOX_RELAY_ENABLED`) + `PENDING_TIMEOUT_MS`                                                     | Relay & cleanup selalu aktif (cuma 1 instance)                   |
+| search-service  | `PORT`, `KAFKA_BROKERS`, `ELASTICSEARCH_URL`                                                                      | Tanpa variabel `SUPABASE_*` — tidak pernah mengakses database    |
+| docker-compose  | tag image `nginx`, `apache/kafka`, `elasticsearch`, `kafka-ui`                                                    | Semua di-pin ke versi spesifik, tidak pernah `:latest`/`:stable` |
+
+`.env.example` lengkap tersedia di tiap folder service — **tidak ada secret asli yang
+ter-commit**, `.env` sungguhan selalu di-`.gitignore`.
+
+## Desain Reliabilitas
+
+- **Outbox pattern** — penulisan data dan "niat mengirim event" terjadi dalam satu transaksi
+  database, menghindari kondisi "data tersimpan tapi event hilang" atau sebaliknya.
+- **Idempotency** — setiap consumer mencatat `eventId` yang sudah diproses (`processed_events`)
+  sebelum mengubah apa pun, sehingga pesan yang terkirim dua kali (termasuk akibat outbox relay
+  yang crash tepat setelah publish, sebelum sempat menandai) tidak menghasilkan efek ganda.
+- **Retry + DLQ** — pesan yang gagal diproses dicoba ulang dengan backoff sampai 3x; kalau tetap
+  gagal (atau memang pesan rusak), dikirim ke topic `.dlq` miliknya sendiri supaya partisi tidak
+  macet dan pesan-pesan berikutnya tetap diproses.
+- **Resilient startup** — semua koneksi ke Kafka dan Elasticsearch memakai retry dengan backoff
+  eksponensial saat startup maupun saat terputus di tengah jalan; service inti (HTTP API) tidak
+  pernah crash hanya karena salah satu dependency belum siap.
+- **Pending timeout** — order yang macet di status `pending` terlalu lama (misal product-service
+  down lama) otomatis ditandai `failed`, tapi tetap bisa "dihidupkan kembali" jadi `confirmed`
+  kalau hasilnya ternyata datang belakangan.
+- **Graceful shutdown** — saat menerima `SIGTERM`, consumer dan producer Kafka diputus dengan
+  rapi sebelum HTTP server ditutup, mencegah pesan setengah diproses saat container di-restart.
+
+## Hasil Uji Skenario Kegagalan
+
+> Diisi dari hasil pengujian nyata — tanggal, output asli, dan screenshot kafka-ui bila relevan.
+
+| #   | Skenario                               | Cara memicu                                                          | Hasil yang diharapkan                                                        | Tanggal diuji | Hasil aktual |
+| --- | -------------------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------- | ------------ |
+| 1   | product-service mati saat order dibuat | Matikan `product-1`+`product-2`, `POST /orders`, nyalakan lagi       | 202 + pending → confirmed otomatis                                           |               |              |
+| 2   | Pesan duplikat                         | Terbitkan ulang `order.created` dengan `eventId` sama                | `duplicate`, stok terpotong sekali                                           |               |              |
+| 3   | Race stok terakhir                     | 10 order paralel untuk stok awal 5                                   | Tepat 5 confirmed, 5 rejected, stok tidak negatif                            |               |              |
+| 4   | Kafka mati                             | Hentikan container `kafka`, buat order                               | Tetap 202; event terkirim setelah Kafka hidup                                |               |              |
+| 5   | Relay crash setelah publish            | Hentikan service tepat setelah kirim, sebelum tandai                 | Event terkirim dua kali, hasil akhir tetap benar                             |               |              |
+| 6   | Pesan rusak                            | Produce teks bukan JSON ke `order.created`                           | Masuk `order.created.dlq`, pesan lain tetap diproses                         |               |              |
+| 7   | Error DB terus-menerus di consumer     | Simulasikan kegagalan RPC sementara                                  | Retry sampai batas lalu DLQ; partisi tidak macet                             |               |              |
+| 8   | Rebalance consumer                     | Matikan `product-1` saat order masuk                                 | `product-2` mengambil alih partisi; order tetap diproses                     |               |              |
+| 9   | Pending timeout & hasil terlambat      | Matikan product-service melewati `PENDING_TIMEOUT_MS`, nyalakan lagi | `failed` (`PENDING_TIMEOUT`) lalu jadi `confirmed`                           |               |              |
+| 10  | Elasticsearch mati                     | Hentikan container `elasticsearch`, ubah produk                      | CRUD normal; index mengejar setelah hidup lagi                               |               |              |
+| 11  | Event produk usang                     | Terbitkan `product.updated` dengan `updatedAt` lama                  | Diabaikan (konflik versi); dokumen tetap yang terbaru                        |               |              |
+| 12  | Penelusuran request                    | Ambil `X-Request-Id` dari respons, cari di semua log                 | Muncul di gateway, order, product (consumer), order (consumer hasil), search |               |              |

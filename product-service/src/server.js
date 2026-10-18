@@ -17,7 +17,9 @@ const server = app.listen(PORT, () => {
 process.on("SIGTERM", async () => {
   console.log("SIGTERM diterima, graceful shutdown...");
   try {
-    if (app.locals.kafkaConsumer) await app.locals.kafkaConsumer.disconnect();
+    for (const consumer of app.locals.kafkaConsumers || []) {
+      await consumer.disconnect();
+    }
     if (app.locals.kafkaProducer) await app.locals.kafkaProducer.disconnect();
   } catch (err) {
     console.error("Error saat disconnect Kafka:", err.message);

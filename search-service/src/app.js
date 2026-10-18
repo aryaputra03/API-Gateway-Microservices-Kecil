@@ -10,6 +10,7 @@ const {
   startKafkaConnectionWatcher,
 } = require("./config/kafka");
 const { startConsumer } = require("./kafka/startConsumer");
+const { startRequestTraceConsumer } = require("./kafka/requestTraceConsumer");
 const productEventsConsumer = require("./kafka/consumers/productEvents.consumer");
 const es = require("./es/client");
 const { ensureIndexResilient } = require("./es/ensureIndex");
@@ -34,8 +35,12 @@ startConsumer(
   "consumer product.events",
 );
 
+// Observe order.created in an independent group for cross-service request tracing.
+const requestTraceKafkaConsumer = startRequestTraceConsumer(kafka, "search");
+
 app.locals.kafkaProducer = kafkaProducer;
 app.locals.kafkaConsumer = productEventsKafkaConsumer;
+app.locals.kafkaConsumers = [productEventsKafkaConsumer, requestTraceKafkaConsumer];
 
 app.use(requestId);
 app.use(helmet());
