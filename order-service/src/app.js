@@ -22,22 +22,24 @@ startKafkaConnectionWatcher(kafkaProducer);
 const OUTBOX_POLL_MS = Number(process.env.OUTBOX_POLL_MS) || 1000;
 startOutboxRelay(supabase, kafkaProducer, OUTBOX_POLL_MS); // << BARU -- order-service cuma 1 instance, tidak perlu flag enable/disable
 
+const { startPendingTimeoutJob } = require("./jobs/pendingTimeout.job"); // << BARU
+
 const stockResultKafkaConsumer = kafka.consumer({
   groupId: "order-service-stock-result",
 });
+
 startConsumer(
   stockResultKafkaConsumer,
+  kafkaProducer, // << BARU
   ["stock.reserved", "stock.rejected"],
-  async ({ message }) => {
-    try {
-      const env = JSON.parse(message.value.toString());
-      await stockResultConsumer.handle(env);
-    } catch (err) {
-      console.error("[kafka] gagal proses stock result:", err.message);
-    }
-  },
+  stockResultConsumer.handle, // << langsung fungsi handle
   "consumer stock result",
 );
+
+startPendingTimeoutJob();
+
+app.locals.kafkaProducer = kafkaProducer;
+app.locals.kafkaConsumer = stockResultKafkaConsumer;
 
 app.use(requestId);
 app.use(helmet());

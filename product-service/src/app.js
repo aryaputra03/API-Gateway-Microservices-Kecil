@@ -35,19 +35,14 @@ const orderCreatedKafkaConsumer = kafka.consumer({
 });
 startConsumer(
   orderCreatedKafkaConsumer,
+  kafkaProducer, // << BARU -- dibutuhkan untuk kirim ke DLQ
   ["order.created"],
-  async ({ message }) => {
-    try {
-      const env = JSON.parse(message.value.toString());
-      await orderCreatedConsumer.handle(env);
-    } catch (err) {
-      // Fase 9 belum ada DLQ -- error cukup di-log. Fase 10 membungkus ini
-      // dengan runWithDlq supaya pesan rusak tidak memblokir partisi selamanya.
-      console.error("[kafka] gagal proses order.created:", err.message);
-    }
-  },
+  orderCreatedConsumer.handle, // << langsung fungsi handle, bukan wrapper manual lagi
   "consumer order.created",
 );
+
+app.locals.kafkaProducer = kafkaProducer;
+app.locals.kafkaConsumer = orderCreatedKafkaConsumer;
 
 app.use(requestId);
 app.use(helmet());

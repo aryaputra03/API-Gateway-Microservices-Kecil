@@ -1,6 +1,15 @@
-// Connect + subscribe + run, dengan retry backoff kalau Kafka belum siap.
-// TIDAK PERNAH melempar ke pemanggil -- service tetap hidup walau Kafka down.
-function startConsumer(consumer, topics, eachMessage, label) {
+const { runWithDlq } = require("./runWithDlq");
+
+// Connect + subscribe + run (dibungkus retry+DLQ), dengan retry backoff
+// kalau Kafka belum siap saat startup. TIDAK PERNAH melempar ke pemanggil.
+function startConsumer(
+  consumer,
+  producer,
+  topics,
+  handle,
+  label,
+  maxAttempts = 3,
+) {
   let attempt = 0;
 
   async function tryStart() {
@@ -9,7 +18,7 @@ function startConsumer(consumer, topics, eachMessage, label) {
       for (const topic of topics) {
         await consumer.subscribe({ topic, fromBeginning: false });
       }
-      await consumer.run({ eachMessage });
+      await runWithDlq({ consumer, producer, handle, maxAttempts });
       console.log(`[kafka] ${label} siap, subscribe ke: ${topics.join(", ")}`);
     } catch (err) {
       attempt += 1;

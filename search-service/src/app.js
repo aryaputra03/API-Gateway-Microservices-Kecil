@@ -1,0 +1,91 @@
+const express = require("express");
+const helmet = require("helmet");
+const cors = require("cors");
+const morgan = require("morgan");
+const searchRoutes = require("./routes/search.routes");
+const { requestId } = require("./middlewares/requestId.middleware");
+const {
+  kafka,
+  kafkaStatus,
+  startKafkaConnectionWatcher,
+} = require("./config/kafka");
+const { startConsumer } = require("./kafka/startConsumer");
+const productEventsConsumer = require("./kafka/consumers/productEvents.consumer");
+const es = require("./es/client");
+const { ensureIndexResilient } = require("./es/ensureIndex");
+
+const app = express();
+
+// Producer di sini CUMA dipakai runWithDlq untuk kirim ke product.events.dlq
+// -- search-service sendiri tidak pernah menerbitkan event apa pun.
+const kafkaProducer = kafka.producer();
+startKafkaConnectionWatcher(kafkaProducer);
+
+ensureIndexResilient(es);
+
+const productEventsKafkaConsumer = kafka.consumer({
+  groupId: "search-service-indexer",
+});
+startConsumer(
+  productEventsKafkaConsumer,
+  kafkaProducer,
+  ["product.events"],
+  productEventsConsumer.handle,
+  "consumer product.events",
+);
+
+app.locals.kafkaProducer = kafkaProducer;
+app.locals.kafkaConsumer = productEventsKafkaConsumer;
+
+app.use(requestId);
+app.use(helmet());
+app.use(cors());
+morgan.token("id", (req) => req.requestId || "-");
+app.use(morgan(":date[iso] [:id] :method :url :status :response-time ms"));
+app.use(express.json({ limit: "10kb" }));
+
+app.get("/health", async (req, res) => {
+  let elasticsearch = "disconnected";
+  try {
+    await es.ping();
+    elasticsearch = "connected";
+  } catch (_) {
+    // tetap "disconnected"
+  }
+  res.status(200).json({
+    success: true,
+    service: "search-service",
+    status: "ok",
+    kafka: kafkaStatus.connected ? "connected" : "disconnected",
+    elasticsearch,
+  });
+});
+
+app.use("/search", searchRoutes);
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Route ${req.method} ${req.originalUrl} tidak ditemukan`,
+    code: "ROUTE_NOT_FOUND",
+  });
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({
+      success: false,
+      message: "Body request bukan JSON yang valid",
+      code: "INVALID_JSON",
+    });
+  }
+  console.error(err);
+  return res.status(500).json({
+    success: false,
+    message: "Terjadi kesalahan pada server",
+    code: "INTERNAL_ERROR",
+  });
+});
+
+module.exports = app;
